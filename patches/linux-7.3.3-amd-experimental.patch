@@ -1,0 +1,75 @@
+--- a/arch/x86/kvm/svm/svm.c
++++ b/arch/x86/kvm/svm/svm.c
+@@ -139,6 +139,10 @@
+ bool __ro_after_init npt_enabled = true;
+ module_param_named(npt, npt_enabled, bool, 0444);
+ 
++static bool __ro_after_init rdtsc_experiment;
++module_param(rdtsc_experiment, bool, 0444);
++MODULE_PARM_DESC(rdtsc_experiment, "Enable experimental per-vCPU RDTSC interception");
++
+ bool gmet_enabled = true;
+ module_param_named(gmet, gmet_enabled, bool, 0444);
+ 
+@@ -1173,6 +1177,8 @@
+ 	svm_set_intercept(svm, INTERCEPT_ICEBP);
+ 	svm_set_intercept(svm, INTERCEPT_RDPRU);
+ 	svm_set_intercept(svm, INTERCEPT_RSM);
++	if (rdtsc_experiment && !is_sev_es_guest(vcpu))
++		svm_set_intercept(svm, INTERCEPT_RDTSC);
+ 
+ 	if (!kvm_mwait_in_guest(vcpu->kvm)) {
+ 		svm_set_intercept(svm, INTERCEPT_MONITOR);
+@@ -1290,6 +1296,7 @@
+ 
+ 	svm->spec_ctrl = 0;
+ 	svm->virt_spec_ctrl = 0;
++	svm->rdtsc_initialized = false;
+ 
+ 	init_vmcb(vcpu, init_event);
+ 
+@@ -3338,7 +3345,32 @@
+ 	return kvm_emulate_hypercall(vcpu);
+ }
+ 
++static int rdtsc_experiment_interception(struct kvm_vcpu *vcpu)
++{
++	struct vcpu_svm *svm = to_svm(vcpu);
++	u64 now, delta;
++
++	if (svm_get_cpl(vcpu) && (kvm_read_cr4(vcpu) & X86_CR4_TSD)) {
++		kvm_inject_gp(vcpu, 0);
++		return 1;
++	}
++
++	now = kvm_read_l1_tsc(vcpu, rdtsc());
++	if (!svm->rdtsc_initialized) {
++		svm->rdtsc_value = now;
++		svm->rdtsc_initialized = true;
++	} else if (now > svm->rdtsc_previous) {
++		delta = now - svm->rdtsc_previous;
++		svm->rdtsc_value += delta / 20;
++	}
++	svm->rdtsc_previous = now;
++	kvm_register_write(vcpu, VCPU_REGS_RAX, (u32)svm->rdtsc_value);
++	kvm_register_write(vcpu, VCPU_REGS_RDX, (u32)(svm->rdtsc_value >> 32));
++	return svm_skip_emulated_instruction(vcpu);
++}
++
+ static int (*const svm_exit_handlers[])(struct kvm_vcpu *vcpu) = {
++	[SVM_EXIT_RDTSC] = rdtsc_experiment_interception,
+ 	[SVM_EXIT_READ_CR0]			= cr_interception,
+ 	[SVM_EXIT_READ_CR3]			= cr_interception,
+ 	[SVM_EXIT_READ_CR4]			= cr_interception,
+--- a/arch/x86/kvm/svm/svm.h
++++ b/arch/x86/kvm/svm/svm.h
+@@ -280,6 +280,9 @@
+ 
+ struct vcpu_svm {
+ 	struct kvm_vcpu vcpu;
++	u64 rdtsc_previous;
++	u64 rdtsc_value;
++	bool rdtsc_initialized;
+ 	/* vmcb always points at current_vmcb->ptr, it's purely a shorthand. */
+ 	struct vmcb *vmcb;
+ 	struct kvm_vmcb_info vmcb01;
